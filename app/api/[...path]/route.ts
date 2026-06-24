@@ -19,8 +19,17 @@ import {
 
 const MOCK_USER = { id: 1, name: "Rangga Putra", platform: "telegram", username: "admin" }
 
+// Demo credentials for the preview. Real deployments should use a proper auth provider.
+const CREDENTIALS = { username: "admin", password: "admin123" }
+const SESSION_COOKIE = "fa_session"
+const SESSION_TOKEN = "fa_demo_session_v1"
+
 function json(data: unknown, init?: number) {
   return NextResponse.json(data, { status: init ?? 200 })
+}
+
+function isAuthenticated(req: NextRequest) {
+  return req.cookies.get(SESSION_COOKIE)?.value === SESSION_TOKEN
 }
 
 async function handle(req: NextRequest, segments: string[]) {
@@ -28,9 +37,35 @@ async function handle(req: NextRequest, segments: string[]) {
   const { searchParams } = req.nextUrl
 
   // ---- Auth ----
-  if (path === "auth/me") return json({ authenticated: true, username: MOCK_USER.username })
-  if (path === "auth/login") return json({ ok: true })
-  if (path === "auth/logout") return json({ ok: true })
+  if (path === "auth/me") {
+    if (isAuthenticated(req)) return json({ authenticated: true, username: MOCK_USER.username })
+    return json({ authenticated: false }, 401)
+  }
+  if (path === "auth/login" && req.method === "POST") {
+    let username = ""
+    let password = ""
+    try {
+      const body = await req.json()
+      username = String(body?.username ?? "").trim()
+      password = String(body?.password ?? "")
+    } catch {}
+    if (username === CREDENTIALS.username && password === CREDENTIALS.password) {
+      const res = json({ ok: true, username })
+      res.cookies.set(SESSION_COOKIE, SESSION_TOKEN, {
+        httpOnly: true,
+        sameSite: "lax",
+        path: "/",
+        maxAge: 60 * 60 * 24 * 7, // 7 days
+      })
+      return res
+    }
+    return json({ detail: "Username atau password salah." }, 401)
+  }
+  if (path === "auth/logout") {
+    const res = json({ ok: true })
+    res.cookies.set(SESSION_COOKIE, "", { httpOnly: true, path: "/", maxAge: 0 })
+    return res
+  }
 
   // ---- Users ----
   if (path === "users") return json([MOCK_USER])
@@ -45,21 +80,13 @@ async function handle(req: NextRequest, segments: string[]) {
       const body = await req.json()
       message = String(body?.message ?? "")
     } catch {}
-    // naive parse: detect income vs expense + a number
-    const isIncome = /jual|terima|masuk|bayar(?:an)?|pendapatan|laku/i.test(message)
-    const num = parseAmount(message)
-    const tx: Tx = {
-      id: "tx_" + Date.now(),
-      date: new Date().toISOString().slice(0, 10),
-      type: isIncome ? "pemasukan" : "pengeluaran",
-      category: isIncome ? "Penjualan Kaos" : "Bahan Kain",
-      amount: num || 100_000,
-      note: message.slice(0, 80) || "transaksi via chat",
-      icon: isIncome ? "👕" : "🧶",
-    }
+    if (!message.trim()) return json({ detail: "Pesan kosong." }, 400)
+    const tx = parseTransaction(message)
     setTransactions([tx, ...getTransactions()])
     return json({
-      reply: `Tercatat ${tx.type} sebesar Rp ${tx.amount.toLocaleString("id-ID")} pada kategori "${tx.category}".`,
+      reply: `Tercatat ${tx.type === "pemasukan" ? "pemasukan" : "pengeluaran"} sebesar Rp ${tx.amount.toLocaleString(
+        "id-ID",
+      )} pada kategori "${tx.category}" ${tx.icon}. Tanggal ${tx.date}.`,
     })
   }
 
@@ -143,15 +170,77 @@ async function handle(req: NextRequest, segments: string[]) {
   return json({ error: "Not found", path }, 404)
 }
 
+// Keyword maps for smarter category detection from natural-language input.
+const CATEGORY_KEYWORDS: Record<string, RegExp> = {
+  "Penjualan Kaos": /\bkaos\b|t-?shirt|tshirt|oblong/i,
+  "Penjualan Kemeja": /kemeja|\bhem\b|\bshirt\b/i,
+  "Penjualan Celana": /celana|chino|jeans|jins|\bpants\b/i,
+  "Jasa Konveksi": /jasa|jahit(?:an)?|konveksi|seragam|sablon|bordir/i,
+  "Bahan Kain": /kain|katun|bahan|fabric|\broll\b|drill|cotton/i,
+  "Benang & Aksesoris": /benang|kancing|resleting|aksesoris|zipper|label|hangtag/i,
+  "Gaji Penjahit": /gaji|upah|penjahit|karyawan|tukang/i,
+  "Listrik & Operasional": /listrik|\bair\b|operasional|sewa|kontrakan|tagihan|internet|wifi|bensin|transport/i,
+}
+
+const EXPENSE_KW = /beli|belanja|bayar|stok|gaji|upah|tagihan|biaya|sewa|ongkos|modal|pengeluaran|keluar|nyetok|restock/i
+const INCOME_KW =
+  /jual|terjual|laku|terima|pemasukan|pendapatan|masuk|omzet|omset|penjualan|order(?:an)?|pesanan|\bdp\b|deposit|laba/i
+
+function parseTransaction(message: string): Tx {
+  const lower = message.toLowerCase()
+  const amount = parseAmount(message) || 100_000
+
+  // Determine income vs expense. Expense keywords win only when no income keyword present,
+  // since phrases like "bayar pesanan" lean toward income for a garment seller.
+  let type: Tx["type"]
+  if (INCOME_KW.test(lower)) type = "pemasukan"
+  else if (EXPENSE_KW.test(lower)) type = "pengeluaran"
+  else type = "pengeluaran"
+
+  // Match a category whose type aligns and whose keywords appear in the message.
+  let matched = CATEGORIES.find((c) => c.type === type && CATEGORY_KEYWORDS[c.name]?.test(lower))
+  // If a keyword matched a category of the other type, trust the keyword and flip the type.
+  if (!matched) {
+    const anyMatch = CATEGORIES.find((c) => CATEGORY_KEYWORDS[c.name]?.test(lower))
+    if (anyMatch) {
+      matched = anyMatch
+      type = anyMatch.type
+    }
+  }
+  if (!matched) matched = CATEGORIES.find((c) => c.type === type)!
+
+  return {
+    id: "tx_" + Date.now(),
+    date: new Date().toISOString().slice(0, 10),
+    type,
+    category: matched.name,
+    amount,
+    note: message.slice(0, 120) || "transaksi via chat",
+    icon: matched.icon,
+  }
+}
+
 function parseAmount(text: string): number {
-  const t = text.toLowerCase().replace(/\./g, "")
-  const m = t.match(/(\d+(?:[.,]\d+)?)\s*(juta|jt|ribu|rb|k)?/)
-  if (!m) return 0
-  let n = Number.parseFloat(m[1].replace(",", "."))
-  const unit = m[2]
-  if (unit === "juta" || unit === "jt") n *= 1_000_000
-  else if (unit === "ribu" || unit === "rb" || unit === "k") n *= 1_000
-  return Math.round(n)
+  // Ignore quantities like "5 pcs", "12 buah", "3 lusin" so they aren't mistaken for the amount.
+  const t = text.toLowerCase().replace(/\d[\d.,]*\s*(pcs|pc|buah|lusin|kodi|biji|unit|set|orang|hari|bulan)\b/g, " ")
+  const re = /(\d[\d.,]*)\s*(juta|jt|ribu|rb|k)?/g
+  const candidates: number[] = []
+  const withUnit: number[] = []
+  let m: RegExpExecArray | null
+  while ((m = re.exec(t)) !== null) {
+    const raw = m[1]
+    const unit = m[2]
+    let n = unit ? Number.parseFloat(raw.replace(",", ".")) : Number.parseFloat(raw.replace(/[.,]/g, ""))
+    if (!Number.isFinite(n)) continue
+    if (unit === "juta" || unit === "jt") n *= 1_000_000
+    else if (unit === "ribu" || unit === "rb" || unit === "k") n *= 1_000
+    candidates.push(n)
+    if (unit) withUnit.push(n)
+  }
+  // Prefer a number that carried a unit (e.g. "750 ribu"); otherwise take the largest number found.
+  if (withUnit.length) return Math.round(Math.max(...withUnit))
+  if (candidates.length) return Math.round(Math.max(...candidates))
+  return 0
 }
 
 function cumulative(series: { label: string; value: number }[]) {
